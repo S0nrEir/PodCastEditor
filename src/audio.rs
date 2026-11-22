@@ -199,64 +199,81 @@ impl Track {
             plan.frames > 0,
             "所有音频都被标记为剪辑，请至少保留一段音频"
         );
-        ensure!(
-            path.extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("wav")),
-            "导出文件请使用 .wav 扩展名"
-        );
         if path.try_exists()? {
             ensure!(
                 !same_file::is_same_file(&self.path, path)?,
                 "请选择不同于原音频的文件名"
             );
-            ensure!(
-                overwrite,
-                "输出文件已存在，请换一个文件名或使用 --overwrite"
-            );
         }
-        let samples = plan.frames * u64::from(self.channels);
-        ensure!(
-            samples * 2 + 68 <= u64::from(u32::MAX),
-            "结果超过标准 WAV 的 4 GiB 上限"
-        );
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let mut tmp = NamedTempFile::new_in(parent).context("无法在输出目录创建文件")?;
-        let spec = hound::WavSpec {
-            channels: self.channels,
-            sample_rate: self.rate,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-        let mut reader = self.reader(plan, 0)?;
-        {
-            let mut out = BufWriter::new(tmp.as_file_mut());
-            let mut wav = hound::WavWriter::new(&mut out, spec)?;
-            let mut remaining = samples;
-            let mut buf = vec![0; 64 * 1024];
-            while remaining > 0 {
-                let n = remaining.min(buf.len() as u64 / 2) as usize;
-                reader.read_exact(&mut buf[..2 * n])?;
-                let mut block = wav.get_i16_writer(n as u32);
-                for b in buf[..2 * n].chunks_exact(2) {
-                    block.write_sample(i16::from_le_bytes([b[0], b[1]]));
-                }
-                block.flush()?;
-                remaining -= n as u64;
-            }
-            wav.finalize()?;
-            out.flush()?;
-        }
-        tmp.as_file().sync_all()?;
-        if overwrite {
-            tmp.persist(path)?;
-        } else {
-            tmp.persist_noclobber(path)?;
-        }
-        Ok(())
+        export_pcm(
+            self.reader(plan, 0)?,
+            self.rate,
+            self.channels,
+            plan.frames,
+            path,
+            overwrite,
+        )
     }
+}
+
+pub(crate) fn export_pcm(
+    mut reader: impl Read,
+    rate: u32,
+    channels: u16,
+    frames: u64,
+    path: &Path,
+    overwrite: bool,
+) -> Result<()> {
+    ensure!(
+        path.extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("wav")),
+        "导出文件请使用 .wav 扩展名"
+    );
+    ensure!(
+        overwrite || !path.try_exists()?,
+        "输出文件已存在，请换一个文件名或使用 --overwrite"
+    );
+    let samples = frames * u64::from(channels);
+    ensure!(
+        samples * 2 + 68 <= u64::from(u32::MAX),
+        "结果超过标准 WAV 的 4 GiB 上限"
+    );
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut tmp = NamedTempFile::new_in(parent).context("无法在输出目录创建文件")?;
+    let spec = hound::WavSpec {
+        channels,
+        sample_rate: rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    {
+        let mut out = BufWriter::new(tmp.as_file_mut());
+        let mut wav = hound::WavWriter::new(&mut out, spec)?;
+        let mut remaining = samples;
+        let mut buf = vec![0; 64 * 1024];
+        while remaining > 0 {
+            let n = remaining.min(buf.len() as u64 / 2) as usize;
+            reader.read_exact(&mut buf[..2 * n])?;
+            let mut block = wav.get_i16_writer(n as u32);
+            for b in buf[..2 * n].chunks_exact(2) {
+                block.write_sample(i16::from_le_bytes([b[0], b[1]]));
+            }
+            block.flush()?;
+            remaining -= n as u64;
+        }
+        wav.finalize()?;
+        out.flush()?;
+    }
+    tmp.as_file().sync_all()?;
+    if overwrite {
+        tmp.persist(path)?;
+    } else {
+        tmp.persist_noclobber(path)?;
+    }
+    Ok(())
 }
 
 fn aac_presentation(path: &Path, track_index: u32, rate: u32, frames: u64) -> Result<Option<Span>> {

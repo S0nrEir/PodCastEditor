@@ -167,7 +167,23 @@ impl Script {
         }
     }
 
-    pub fn header(&mut self, ui: &mut Ui) {
+    pub fn reading_copy(&self) -> Option<(PathBuf, egui::text::LayoutJob)> {
+        let doc = self.doc.as_ref()?;
+        let job = if self.raw {
+            View::new(&doc.source, &self.names, false)
+                .job
+                .borrow()
+                .clone()
+        } else {
+            doc.view.job.borrow().clone()
+        };
+        Some((doc.path.clone(), job))
+    }
+
+    pub fn header(&mut self, ui: &mut Ui) -> bool {
+        let record = ui
+            .add_enabled(self.doc.is_some(), egui::Button::new("用此稿录音"))
+            .clicked();
         if ui
             .add_enabled(self.doc.is_some(), egui::Button::new("保存"))
             .on_hover_text(shortcut_name(ui.ctx(), Key::S))
@@ -178,6 +194,7 @@ impl Script {
         if ui.button("导入讲稿…").clicked() {
             self.pick(ui.ctx());
         }
+        record
     }
 
     fn restore_selection(&self, ctx: &Context, focus: bool) {

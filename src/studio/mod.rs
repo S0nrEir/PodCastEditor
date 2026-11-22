@@ -1,4 +1,5 @@
 mod playback;
+mod recording;
 mod script;
 mod timeline;
 use crate::{
@@ -177,9 +178,17 @@ enum Action {
     Switch(bool),
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Audio,
+    Script,
+    Recording,
+}
+
 pub struct Studio {
     script: script::Script,
-    show_script: bool,
+    mode: Mode,
+    recording: recording::Recording,
     doc: Option<Document>,
     worker: Option<mpsc::Receiver<Result<Finished>>>,
     player: Option<Playback>,
@@ -193,7 +202,8 @@ impl Studio {
         theme(&cc.egui_ctx);
         let mut app = Self {
             script: script::Script::default(),
-            show_script: false,
+            mode: Mode::Audio,
+            recording: Default::default(),
             doc: None,
             worker: None,
             player: None,
@@ -203,13 +213,33 @@ impl Studio {
         };
         if let Some(path) = path {
             if script::is_script(&path) {
-                app.show_script = true;
+                app.mode = Mode::Script;
                 app.script.open(&cc.egui_ctx, path);
             } else {
                 app.import(&cc.egui_ctx, path);
             }
         }
         app
+    }
+
+    fn switch_mode(&mut self, mode: Mode) {
+        if mode == self.mode || self.recording.exporting() {
+            return;
+        }
+        if mode == Mode::Recording {
+            if !self.recording.load(self.script.reading_copy()) {
+                return;
+            }
+            self.player = None;
+        } else if self.mode == Mode::Recording {
+            self.recording.stop();
+        }
+        self.mode = mode;
+    }
+
+    fn confirm_close(&mut self) -> bool {
+        self.recording.stop();
+        self.script.confirm_leave() && self.recording.confirm_leave()
     }
 
     fn work(
@@ -749,7 +779,9 @@ fn editor(ui: &mut Ui, doc: &Document, playing: bool, action: &mut Option<Action
 impl eframe::App for Studio {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.poll();
+        self.recording.poll();
         let busy = self.worker.is_some();
+        let wait_to_close = busy || self.recording.exporting();
         if let Some(player) = &self.player
             && let Some(doc) = &mut self.doc
         {
@@ -759,29 +791,34 @@ impl eframe::App for Studio {
             }
             ctx.request_repaint_after(Duration::from_millis(35));
         }
-        if busy && ctx.input(|i| i.viewport().close_requested()) {
+        if wait_to_close && ctx.input(|i| i.viewport().close_requested()) {
+            self.recording.stop();
             self.close_after_work = true;
             self.status = "当前任务完成后将关闭窗口…".into();
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-        } else if !busy && self.close_after_work {
+        } else if !wait_to_close && self.close_after_work {
             self.close_after_work = false;
-            if self.script.confirm_leave() {
+            if self.confirm_close() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             return;
-        } else if ctx.input(|i| i.viewport().close_requested()) && !self.script.confirm_leave() {
+        } else if ctx.input(|i| i.viewport().close_requested()) && !self.confirm_close() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
         let mut action = None;
-        if let Some(path) = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone())) {
+        if !self.recording.exporting()
+            && let Some(path) =
+                ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()))
+        {
             if script::is_script(&path) {
-                self.show_script = true;
+                self.switch_mode(Mode::Script);
                 self.script.open(ctx, path);
             } else if !busy {
-                self.show_script = false;
+                self.switch_mode(Mode::Audio);
                 action = Some(Action::Import(path));
             }
         }
+        let mut requested = self.mode;
         egui::TopBottomPanel::top("header")
             .frame(panel(PANEL, 14))
             .show(ctx, |ui| {
@@ -789,11 +826,19 @@ impl eframe::App for Studio {
                     logo(ui);
                     ui.label(RichText::new("声剪").size(23.0).strong());
                     ui.separator();
-                    ui.selectable_value(&mut self.show_script, false, "音频剪辑");
-                    ui.selectable_value(&mut self.show_script, true, "讲稿编辑");
+                    ui.add_enabled_ui(!self.recording.exporting(), |ui| {
+                        ui.selectable_value(&mut requested, Mode::Audio, "音频剪辑");
+                        ui.selectable_value(&mut requested, Mode::Script, "讲稿编辑");
+                        ui.selectable_value(&mut requested, Mode::Recording, "录音模式");
+                    });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if self.show_script {
-                            self.script.header(ui);
+                        if self.mode == Mode::Script {
+                            if self.script.header(ui) {
+                                requested = Mode::Recording;
+                            }
+                            return;
+                        }
+                        if self.mode == Mode::Recording {
                             return;
                         }
                         if ui
@@ -814,7 +859,12 @@ impl eframe::App for Studio {
                     });
                 });
             });
-        if self.show_script {
+        self.switch_mode(requested);
+        if self.mode == Mode::Recording {
+            self.recording.show(ctx);
+            return;
+        }
+        if self.mode == Mode::Script {
             self.script.show(ctx);
             return;
         }

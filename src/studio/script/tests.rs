@@ -358,8 +358,13 @@ fn manuscript_edits_and_keyboard_save_reopen_exactly() {
     frame(&mut script, vec![shortcut(Key::Num4)]);
     let expected = format!("{source}<补充=\"测试稿尾🎧\">");
     assert_eq!(script.doc.as_ref().unwrap().source, expected);
+    // Recording reads the unsaved, formatted manuscript even from source mode.
+    let formatted = script.reading_copy().unwrap().1;
+    assert_eq!(formatted.text, format!("{original_preview}测试稿尾🎧"));
+    assert!(script.doc.as_ref().unwrap().dirty());
     script.raw = true;
     script.rebuild(&ctx, true);
+    assert_eq!(script.reading_copy().unwrap().1, formatted);
     frame(&mut script, vec![shortcut(Key::S)]);
     assert!(!script.doc.as_ref().unwrap().dirty());
     let restored = Document::open(path.clone(), &names(), false).unwrap();

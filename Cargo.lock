@@ -2589,11 +2589,14 @@ name = "podcast-editor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "block2 0.6.2",
  "clap",
  "core-text",
+ "cpal",
  "eframe",
  "hound",
  "mp4",
+ "objc2 0.6.5",
  "pulldown-cmark",
  "rfd",
  "rodio",
