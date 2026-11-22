@@ -212,9 +212,15 @@ pub struct View {
     pub text: String,
     cells: Vec<Glyph>,
     pub marks: Vec<Mark>,
+    pub passages: Vec<Passage>,
     groups: Vec<Range<usize>>,
     pub job: Rc<RefCell<LayoutJob>>,
     raw: bool,
+}
+
+pub struct Passage {
+    pub text: String,
+    pub color: Color32,
 }
 
 impl View {
@@ -238,6 +244,7 @@ impl View {
         let marks = marks(source, names);
         let mut groups: Vec<_> = marks.iter().map(|m| m.outer.clone()).collect();
         let mut palette = names.to_vec();
+        let mut colors = Vec::with_capacity(marks.len());
         for mark in &marks {
             let index = palette
                 .iter()
@@ -248,13 +255,31 @@ impl View {
                 });
             for c in &mut cells[indices(&offsets, mark.outer.clone())] {
                 c.style.tag = Some(index);
-                if !raw && !mark.body.contains(&c.raw.start) {
-                    c.visible = false;
-                }
             }
-            if mark.attribute && !raw {
+            colors.push(color(index));
+        }
+        // The outline always uses the rendered wording, including in source mode.
+        let mut passages = Vec::new();
+        if !raw || !marks.is_empty() {
+            let mut rendered = if raw {
+                cells.clone()
+            } else {
+                std::mem::take(&mut cells)
+            };
+            for mark in &marks {
+                for range in [
+                    mark.outer.start..mark.body.start,
+                    mark.body.end..mark.outer.end,
+                ] {
+                    for c in &mut rendered[indices(&offsets, range)] {
+                        c.visible = false;
+                    }
+                }
+                if !mark.attribute {
+                    continue;
+                }
                 let mut skip_to = 0;
-                for c in &mut cells[indices(&offsets, mark.body.clone())] {
+                for c in &mut rendered[indices(&offsets, mark.body.clone())] {
                     c.attribute = true;
                     if c.raw.start < skip_to {
                         c.visible = false;
@@ -267,15 +292,26 @@ impl View {
                     }
                 }
             }
-        }
-        if !raw {
-            cells.retain(|c| c.visible);
-            markdown(&mut cells, &mut groups);
+            rendered.retain(|c| c.visible);
+            let mut rendered_groups = Vec::new();
+            markdown(&mut rendered, &mut rendered_groups);
+            for (mark, color) in marks.iter().zip(colors) {
+                let first = rendered.partition_point(|c| c.raw.start < mark.body.start);
+                let end = rendered.partition_point(|c| c.raw.start < mark.body.end);
+                let body: String = rendered[first..end].iter().map(|c| c.ch).collect();
+                let text = body.split_whitespace().collect::<Vec<_>>().join(" ");
+                passages.push(Passage { text, color });
+            }
+            if !raw {
+                cells = rendered;
+                groups.extend(rendered_groups);
+            }
         }
         let mut view = Self {
             text: cells.iter().map(|c| c.ch).collect(),
             cells,
             marks,
+            passages,
             groups,
             job: Default::default(),
             raw,
@@ -355,6 +391,28 @@ impl<'a> Buffer<'a> {
     }
     fn checkpoint(&mut self) {
         self.before.get_or_insert_with(|| self.source.clone());
+    }
+
+    // Hidden delimiters can put two source boundaries at the same screen caret.
+    // Keep an explicitly restored boundary (e.g. after the final closing tag).
+    pub fn restore_caret(&mut self, pos: usize) {
+        let index = self.view.cursor(pos);
+        if self.view.source_pos(index) != pos
+            && (pos == self.source.len()
+                || self
+                    .view
+                    .marks
+                    .iter()
+                    .any(|m| m.outer.end == pos || m.outer.start == pos))
+        {
+            self.insertion = Some((index, pos, false));
+        }
+    }
+
+    pub fn caret_source(&self, index: usize) -> usize {
+        self.insertion
+            .filter(|(i, _, _)| *i == index)
+            .map_or_else(|| self.view.source_pos(index), |(_, pos, _)| pos)
     }
 }
 

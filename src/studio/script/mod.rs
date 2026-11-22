@@ -1,5 +1,6 @@
 mod document;
 mod hint_label;
+mod minimap;
 mod tags;
 #[cfg(test)]
 mod tests;
@@ -19,6 +20,9 @@ use std::{
 };
 use tags::{DEFAULTS, color, valid_name};
 use view::{Buffer, View};
+
+const TAG_PANEL_WIDTH: f32 = 222.;
+const MIN_EDITOR_WIDTH: f32 = 360.;
 
 const DIGITS: [Key; 9] = [
     Key::Num1,
@@ -55,6 +59,36 @@ fn editor_id() -> Id {
     Id::new("script-content")
 }
 
+fn outline_text(
+    ui: &Ui,
+    text: &str,
+    format: &egui::TextFormat,
+    width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    ui.fonts(|fonts| {
+        let mut job = egui::text::LayoutJob::simple_singleline(
+            text.to_owned(),
+            format.font_id.clone(),
+            format.color,
+        );
+        job.wrap = egui::text::TextWrapping::truncate_at_width(width);
+        job.wrap.overflow_character = None;
+        let line = fonts.layout_job(job);
+        if !line.elided {
+            return line;
+        }
+        let layout = |text| fonts.layout_no_wrap(text, format.font_id.clone(), format.color);
+        let suffix_width = layout("...".into()).size().x;
+        let prefix: String = line.rows[0]
+            .glyphs
+            .iter()
+            .take_while(|glyph| glyph.max_x() <= width - suffix_width)
+            .map(|glyph| glyph.chr)
+            .collect();
+        layout(format!("{}...", prefix.trim_end()))
+    })
+}
+
 pub struct Script {
     doc: Option<Document>,
     names: Vec<String>,
@@ -67,6 +101,7 @@ pub struct Script {
     error: bool,
     generation: u64,
     keyboard_hint: bool,
+    minimap: minimap::Minimap,
 }
 
 impl Default for Script {
@@ -99,6 +134,7 @@ impl Default for Script {
             message: load.err().map_or_else(String::new, |e| e.to_string()),
             generation: 0,
             keyboard_hint: false,
+            minimap: Default::default(),
         }
     }
 }
@@ -146,6 +182,7 @@ impl Script {
             Ok(doc) => {
                 self.doc = Some(doc);
                 self.generation += 1;
+                self.minimap = Default::default();
                 self.keyboard_hint = false;
                 self.picker = false;
                 self.message.clear();
@@ -383,7 +420,71 @@ impl Script {
         }
     }
 
-    fn editor(&mut self, ui: &mut Ui) {
+    fn outline(&mut self, ui: &mut Ui) -> bool {
+        let Some(doc) = &mut self.doc else {
+            return false;
+        };
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            title(ui, "标记片段");
+            hint(ui, &format!("{} 段", doc.view.marks.len()));
+        });
+        ui.separator();
+        if doc.view.marks.is_empty() {
+            hint(ui, "添加标签后，片段会显示在这里");
+            return false;
+        }
+        let active = doc.current_mark().map(|m| m.outer.start);
+        let mut target = None;
+        egui::ScrollArea::vertical()
+            .id_salt(("script-outline", self.generation))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.with_layout(egui::Layout::top_down_justified(egui::Align::Min), |ui| {
+                    for (mark, passage) in doc.view.marks.iter().zip(&doc.view.passages) {
+                        let width = ui.available_width();
+                        let tag_style = egui::TextFormat::simple(
+                            egui::FontId::proportional(13.),
+                            passage.color,
+                        );
+                        let tag = outline_text(ui, &mark.name, &tag_style, width * 0.5);
+                        let body = if passage.text.is_empty() {
+                            "（空白片段）"
+                        } else {
+                            &passage.text
+                        };
+                        let body_style = egui::TextFormat::simple(
+                            egui::FontId::proportional(14.),
+                            ui.visuals().text_color(),
+                        );
+                        let gap = ui.spacing().item_spacing.x;
+                        let excerpt =
+                            outline_text(ui, body, &body_style, width - tag.size().x - gap);
+                        let mut label = egui::text::LayoutJob::default();
+                        label.append(tag.text(), 0., tag_style);
+                        label.append(excerpt.text(), gap, body_style);
+                        let galley = ui.fonts(|fonts| fonts.layout_job(label));
+                        let row = ui.add(
+                            egui::Button::new(galley)
+                                .frame(false)
+                                .selected(active == Some(mark.outer.start)),
+                        );
+                        if row.clicked() {
+                            target = Some(mark.body.clone());
+                        }
+                        ui.separator();
+                    }
+                });
+            });
+        if let Some(range) = target {
+            doc.selected = range;
+            self.restore_selection(ui.ctx(), true);
+            return true;
+        }
+        false
+    }
+
+    fn editor(&mut self, ui: &mut Ui, jump: bool) {
         let Some(doc) = &mut self.doc else {
             ui.add_space(ui.available_height() * 0.29);
             ui.vertical_centered(|ui| {
@@ -402,9 +503,15 @@ impl Script {
             });
             return;
         };
+        let map_width = (ui.available_width() * 0.19).clamp(72., 136.);
         let mut toggled = false;
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(map_width, ui.spacing().interact_size.y),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| hint(ui, "讲稿预览"),
+                );
                 toggled = ui.checkbox(&mut self.raw, "源码模式").changed();
                 ui.separator();
                 ui.add(
@@ -422,22 +529,45 @@ impl Script {
             self.rebuild(ui.ctx(), true);
         }
         let doc = self.doc.as_mut().unwrap();
+        let body = ui.available_rect_before_wrap();
+        let mut map = body;
+        map.min.x = (body.right() - map_width).max(body.left());
+        let mut pages = body;
+        pages.max.x = (map.left() - ui.spacing().item_spacing.x).max(body.left());
+        ui.allocate_rect(body, egui::Sense::hover());
+        let map_response = ui.interact(
+            map,
+            ui.make_persistent_id("script-minimap"),
+            egui::Sense::click_and_drag(),
+        );
+        let mut page_ui = ui.new_child(egui::UiBuilder::new().max_rect(pages));
+        page_ui.shrink_clip_rect(pages);
         let layout = doc.view.job.clone();
+        let mut clean_galley = None;
         let mut layouter = |ui: &Ui, text: &str, width: f32| {
             let mut job = layout.borrow().clone();
             debug_assert_eq!(job.text, text);
             job.wrap.max_width = width;
-            ui.fonts(|f| f.layout_job(job))
+            let galley = ui.fonts(|f| f.layout_job(job));
+            clean_galley = Some(galley.clone());
+            galley
         };
         let old_selection = doc.selected.clone();
         let mut buffer = Buffer::new(&mut doc.view, &mut doc.source, doc.newline);
+        if old_selection.is_empty() {
+            buffer.restore_caret(old_selection.start);
+        }
         let mut apply = None;
         let mut remove_mark = false;
         let mut updated = false;
-        egui::ScrollArea::vertical()
+        let mut text_origin = egui::Vec2::ZERO;
+        let scroll = egui::ScrollArea::vertical()
             .id_salt(("script-pages", self.generation))
             .auto_shrink([false, false])
-            .show(ui, |ui| {
+            .animated(false)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .show(&mut page_ui, |ui| {
+                let origin = ui.min_rect().min;
                 let mut out = TextEdit::multiline(&mut buffer)
                     .id(editor_id())
                     .frame(false)
@@ -446,12 +576,21 @@ impl Script {
                     .desired_rows(12)
                     .layouter(&mut layouter)
                     .show(ui);
-                if toggled && let Some(cursors) = out.state.cursor.range(&out.galley) {
-                    let caret = out
-                        .galley
-                        .pos_from_cursor(&cursors.primary)
-                        .translate(out.galley_pos.to_vec2());
-                    ui.scroll_to_rect(caret, None);
+                text_origin = out.galley_pos - origin;
+                if (jump || toggled)
+                    && let Some(cursors) = out.state.cursor.range(&out.galley)
+                {
+                    let (cursor, align) = if jump {
+                        (&cursors.secondary, Some(egui::Align::Center))
+                    } else {
+                        (&cursors.primary, None)
+                    };
+                    ui.scroll_to_rect(
+                        out.galley
+                            .pos_from_cursor(cursor)
+                            .translate(out.galley_pos.to_vec2()),
+                        align,
+                    );
                 }
                 // TextEdit moves the caret on any mouse-button press. Keep the selection
                 // anchored while a secondary click opens its tag menu.
@@ -473,7 +612,7 @@ impl Script {
                 if let Some(cursors) = out.state.cursor.char_range() {
                     let a = cursors.primary.index.min(cursors.secondary.index);
                     let b = cursors.primary.index.max(cursors.secondary.index);
-                    let pos = buffer.view.source_pos(a);
+                    let pos = buffer.caret_source(a);
                     doc.selected = buffer.view.selection(a..b).unwrap_or(pos..pos);
                 }
                 if !doc.selected.is_empty() {
@@ -505,6 +644,17 @@ impl Script {
                     hint_label::show(ui, &out, buffer.view, &mut self.keyboard_hint);
                 }
             });
+        if let Some(galley) = clean_galley
+            && let Some(offset) = self
+                .minimap
+                .show(ui, map_response, &galley, text_origin, &scroll)
+            && offset != scroll.state.offset.y
+        {
+            let mut state = scroll.state;
+            state.offset.y = offset;
+            state.store(ui.ctx(), scroll.id);
+            ui.ctx().request_repaint();
+        }
         if let Some(source) = buffer.before {
             doc.record(Snapshot {
                 source,
@@ -556,14 +706,23 @@ impl Script {
                     }));
                 });
             });
+        let window_width = ctx.available_rect().width();
+        let jump = self.doc.is_some()
+            && egui::SidePanel::left("script-outline")
+                .resizable(true)
+                .default_width((window_width * 0.18).clamp(150., 220.))
+                .width_range(140. ..=(window_width - TAG_PANEL_WIDTH - MIN_EDITOR_WIDTH).max(140.))
+                .frame(panel(PANEL, 12))
+                .show(ctx, |ui| self.outline(ui))
+                .inner;
         egui::SidePanel::right("script-tags")
             .resizable(false)
-            .exact_width(222.)
+            .exact_width(TAG_PANEL_WIDTH)
             .frame(panel(PANEL, 14))
             .show(ctx, |ui| self.sidebar(ui));
         egui::CentralPanel::default()
             .frame(panel(BASE, 20))
-            .show(ctx, |ui| self.editor(ui));
+            .show(ctx, |ui| self.editor(ui, jump));
         // Commit text and IME events delivered in the same frame before writing.
         if save {
             self.save();

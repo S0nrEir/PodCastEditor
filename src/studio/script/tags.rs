@@ -126,6 +126,7 @@ pub fn marks(source: &str, names: &[String]) -> Vec<Mark> {
             });
         }
     }
-    result.sort_by_key(|m| m.outer.start);
+    // Navigation follows the text that each entry jumps to, including nested marks.
+    result.sort_by_key(|m| m.body.start);
     result
 }

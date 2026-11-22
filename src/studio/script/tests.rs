@@ -140,6 +140,336 @@ fn select(doc: &mut Document, needle: &str) {
 }
 
 #[test]
+fn outline_shows_rendered_nested_and_attribute_text_in_both_modes() {
+    let source = "<自定义>**甲**\r\n<补充=\"乙&amp;丙\"></自定义> <验证></验证>";
+    for raw in [false, true] {
+        let view = View::new(source, &names(), raw);
+        let entries: Vec<_> = view
+            .passages
+            .iter()
+            .map(|p| (p.text.as_str(), p.color))
+            .collect();
+        assert_eq!(
+            entries,
+            [("甲 乙&丙", color(5)), ("乙&丙", color(3)), ("", color(4))]
+        );
+    }
+}
+
+#[test]
+fn outline_abbreviates_to_one_line_in_document_order_after_reverse_tagging() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("顺序.md");
+    let opening = "开场先介绍本期话题和嘉宾，接着回顾上一期节目，然后开始讨论。".repeat(3);
+    fs::write(&path, format!("{opening}\n\n中段\n转场\n\n收尾")).unwrap();
+    let ctx = Context::default();
+    super::super::theme(&ctx);
+    let mut script = Script {
+        names: names(),
+        ..Default::default()
+    };
+    script.open(&ctx, path.clone());
+    for (body, tag) in [("收尾", 0), ("中段\n转场", 3), (opening.as_str(), 4)] {
+        select(script.doc.as_mut().unwrap(), body);
+        script.apply(&ctx, tag);
+    }
+    assert!(script.save());
+    for (raw, width) in [(false, 840.), (true, 1200.)] {
+        script.raw = raw;
+        if raw {
+            script.open(&ctx, path.clone());
+        }
+        let frame = |s: &mut Script, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 620.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| s.show(ctx),
+            )
+        };
+        frame(&mut script, vec![]);
+        let out = frame(&mut script, vec![]);
+        let mut rows: Vec<_> = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(t)
+                    if s.clip_rect.right() < width * 0.25 && t.galley.job.sections.len() == 2 =>
+                {
+                    Some(t)
+                }
+                _ => None,
+            })
+            .collect();
+        rows.sort_by(|a, b| a.pos.y.total_cmp(&b.pos.y));
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|t| t.galley.rows.len() == 1));
+        let labels: Vec<_> = rows.iter().map(|t| t.galley.text()).collect();
+        assert!(labels[0].starts_with("验证开场") && labels[0].ends_with("..."));
+        assert!(labels[0].len() < opening.len());
+        assert_eq!(labels[1..], ["补充中段 转场", "背景介绍收尾"]);
+
+        let pos = rows[0].visual_bounding_rect().center();
+        for pressed in [true, false] {
+            frame(
+                &mut script,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        let doc = script.doc.as_ref().unwrap();
+        assert_eq!(&doc.source[doc.selected.clone()], opening);
+    }
+}
+
+#[test]
+fn dragging_outline_divider_refits_the_single_line_entries() {
+    use egui::{Event, PointerButton, Shape, containers::panel::PanelState};
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("调整栏宽.md");
+    let name = "需要在窄栏截短的标签";
+    let passage = "这是随栏宽显示的讲稿摘录。";
+    fs::write(
+        &path,
+        format!("<{name}>{passage}</{name}>\n<验证>结尾</验证>"),
+    )
+    .unwrap();
+    let ctx = Context::default();
+    super::super::theme(&ctx);
+    let mut script = Script::default();
+    script.open(&ctx, path);
+    let mut frame = |events| {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1110., 620.),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| script.show(ctx),
+        )
+    };
+    let panel = || {
+        PanelState::load(&ctx, Id::new("script-outline"))
+            .unwrap()
+            .rect
+    };
+    let labels = |out: &egui::FullOutput| {
+        out.shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                Shape::Text(t) if panel().contains(t.pos) && t.galley.job.sections.len() == 2 => {
+                    assert_eq!(t.galley.rows.len(), 1);
+                    assert!(t.pos.x + t.galley.size().x <= panel().right());
+                    Some(t.galley.text().to_owned())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let button = |pos, pressed| Event::PointerButton {
+        pos,
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: Modifiers::NONE,
+    };
+    frame(vec![]);
+    let initial = labels(&frame(vec![]));
+    assert!(initial[0].ends_with("..."));
+    let grab = panel().right_center();
+    frame(vec![Event::PointerMoved(grab), button(grab, true)]);
+    let wide = grab + egui::vec2(260., 0.);
+    let expanded = labels(&frame(vec![Event::PointerMoved(wide)]));
+    assert!((panel().right() - wide.x).abs() < 1.);
+    assert_eq!(
+        expanded,
+        [format!("{name}{passage}"), "验证结尾".to_owned()]
+    );
+    let narrow = grab - egui::vec2(55., 0.);
+    let shrunk = labels(&frame(vec![Event::PointerMoved(narrow)]));
+    assert!((panel().right() - narrow.x).abs() < 1.);
+    assert!(shrunk[0].len() < initial[0].len() && shrunk[0].ends_with("..."));
+    assert_eq!(shrunk[1], "验证结尾");
+    frame(vec![button(narrow, false)]);
+    assert_eq!(labels(&frame(vec![])), shrunk);
+}
+
+#[test]
+fn clicking_duplicate_passages_and_dragging_the_minimap_navigates_the_editor() {
+    use egui::{Event, FullOutput, PointerButton, Shape, epaint::TextShape};
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("导航.md");
+    let paragraph = "一段足够长的讲稿，用于检查窗口宽度改变后的自动换行。".repeat(3) + "\r\n";
+    let mark = "<验证>相同的片段</验证>\r\n";
+    let source = format!(
+        "{mark}{}{mark}{}结尾",
+        paragraph.repeat(65),
+        paragraph.repeat(50)
+    );
+    fs::write(&path, &source).unwrap();
+    let second = source.rfind("相同的片段").unwrap();
+    for (raw, width) in [(false, 1110.), (true, 840.)] {
+        let ctx = Context::default();
+        super::super::theme(&ctx);
+        let mut script = Script {
+            names: names(),
+            raw,
+            ..Default::default()
+        };
+        script.open(&ctx, path.clone());
+        let text = script.doc.as_ref().unwrap().view.text.clone();
+        let frame = |script: &mut Script, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 620.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| script.show(ctx),
+            )
+        };
+        let button = |pos, pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        let find_text = |out: &FullOutput, needle: &str| -> Vec<(egui::Rect, TextShape)> {
+            out.shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    Shape::Text(t) if t.galley.text() == needle => Some((s.clip_rect, t.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        let thumb = |out: &FullOutput| {
+            out.shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    Shape::Rect(r) if r.stroke.color == ACCENT.gamma_multiply(0.8) => Some(r.rect),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        frame(&mut script, vec![]);
+        let out = frame(&mut script, vec![]);
+        let document_shapes = find_text(&out, &text);
+        assert_eq!(document_shapes.len(), 2);
+        let (map, preview) = &document_shapes[1];
+        let full_size = document_shapes[0].1.galley.size();
+        let miniature = preview.galley.size();
+        assert!((miniature.x / full_size.x - miniature.y / full_size.y).abs() < 0.001);
+        assert!(
+            miniature.y > map.height(),
+            "long preview should pan without distorting glyphs"
+        );
+        assert!(
+            preview
+                .galley
+                .rows
+                .iter()
+                .flat_map(|r| &r.visuals.mesh.vertices)
+                .any(|v| v.color == color(4))
+        );
+        let items = find_text(&out, "验证相同的片段");
+        assert_eq!(items.len(), 2);
+        let pos = items[1].1.visual_bounding_rect().center();
+        frame(
+            &mut script,
+            vec![Event::PointerMoved(pos), button(pos, true)],
+        );
+        frame(&mut script, vec![button(pos, false)]);
+        let out = frame(&mut script, vec![]);
+        let expected = second..second + "相同的片段".len();
+        let doc = script.doc.as_ref().unwrap();
+        assert_eq!(doc.selected, expected);
+        assert!(
+            ctx.memory(|m| m.has_focus(editor_id())),
+            "jump should focus the tagged text"
+        );
+        let main = &find_text(&out, &text)[0];
+        let caret = main
+            .1
+            .galley
+            .pos_from_ccursor(CCursor::new(doc.view.cursor(second)))
+            .translate(main.1.pos.to_vec2());
+        assert!(
+            main.0.contains(caret.center()),
+            "jump must reveal the second occurrence"
+        );
+        let handle = thumb(&out);
+        let grab = handle.left_top() + egui::vec2(3., 2.);
+        let pressed = frame(
+            &mut script,
+            vec![Event::PointerMoved(grab), button(grab, true)],
+        );
+        assert!((thumb(&pressed).top() - handle.top()).abs() < 1.);
+        let bottom = map.center_bottom() + egui::vec2(0., 8.);
+        frame(&mut script, vec![Event::PointerMoved(bottom)]);
+        let out = frame(&mut script, vec![]);
+        let main = &find_text(&out, &text)[0];
+        let last = main.1.galley.rows.last().unwrap().rect.center() + main.1.pos.to_vec2();
+        assert!(main.0.contains(last), "drag to end");
+        let top = map.center_top() - egui::vec2(0., 8.);
+        frame(&mut script, vec![Event::PointerMoved(top)]);
+        frame(&mut script, vec![button(top, false)]);
+        let out = frame(&mut script, vec![]);
+        let main = &find_text(&out, &text)[0];
+        assert!(main.0.contains(main.1.pos), "drag back to beginning");
+        let small = &find_text(&out, &text)[1].1;
+        let click = map.center_bottom() - egui::vec2(0., 18.);
+        let scale = small.galley.size().y / main.1.galley.size().y;
+        let clicked_text_y = (click.y - small.pos.y) / scale;
+        frame(
+            &mut script,
+            vec![Event::PointerMoved(click), button(click, true)],
+        );
+        frame(&mut script, vec![button(click, false)]);
+        let out = frame(&mut script, vec![]);
+        let main = &find_text(&out, &text)[0];
+        assert!(
+            (main.1.pos.y + clicked_text_y - main.0.center().y).abs() < 5.,
+            "click must center the text actually shown at that point in the preview"
+        );
+        let before_wheel = thumb(&out).top();
+        frame(
+            &mut script,
+            vec![
+                Event::PointerMoved(main.0.center()),
+                Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0., -300.),
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(thumb(&frame(&mut script, vec![])).top() > before_wheel);
+        let doc = script.doc.as_ref().unwrap();
+        assert_eq!(doc.selected, expected);
+        assert!(!doc.dirty());
+    }
+}
+
+#[test]
 fn both_modes_share_source_and_all_five_tags_round_trip() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("讲稿.md");
@@ -358,6 +688,18 @@ fn manuscript_edits_and_keyboard_save_reopen_exactly() {
     frame(&mut script, vec![shortcut(Key::Num4)]);
     let expected = format!("{source}<补充=\"测试稿尾🎧\">");
     assert_eq!(script.doc.as_ref().unwrap().source, expected);
+    assert_eq!(
+        script
+            .doc
+            .as_ref()
+            .unwrap()
+            .view
+            .passages
+            .last()
+            .unwrap()
+            .text,
+        "测试稿尾🎧"
+    );
     // Recording reads the unsaved, formatted manuscript even from source mode.
     let formatted = script.reading_copy().unwrap().1;
     assert_eq!(formatted.text, format!("{original_preview}测试稿尾🎧"));
@@ -372,6 +714,16 @@ fn manuscript_edits_and_keyboard_save_reopen_exactly() {
     assert_eq!(restored.view.text, format!("{original_preview}测试稿尾🎧"));
     frame(&mut script, vec![shortcut(Key::Z)]);
     frame(&mut script, vec![shortcut(Key::Z)]);
+    assert!(
+        !script
+            .doc
+            .as_ref()
+            .unwrap()
+            .view
+            .passages
+            .iter()
+            .any(|p| p.text == "测试稿尾🎧")
+    );
     frame(&mut script, vec![shortcut(Key::S)]);
     assert_eq!(fs::read(path).unwrap(), bytes);
 }
