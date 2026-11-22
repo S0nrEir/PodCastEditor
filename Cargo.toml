@@ -1,0 +1,25 @@
+[package]
+name = "podcast-editor"
+version = "0.1.0"
+edition = "2024"
+description = "带波形选区和批量剪辑标记的播客编辑器"
+default-run = "podcast-editor"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+hound = "3.5"
+mp4 = "0.14"
+rfd = "0.15"
+rodio = { version = "0.20", default-features = false }
+symphonia = { version = "0.5.5", features = ["mp3", "aac", "alac", "isomp4", "flac", "vorbis", "wav", "pcm", "aiff"] }
+tempfile = "3"
+same-file = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+
+[profile.dev]
+debug = 0
+
