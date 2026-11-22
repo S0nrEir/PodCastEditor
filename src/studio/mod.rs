@@ -1,4 +1,5 @@
 mod playback;
+mod script;
 mod timeline;
 use crate::{
     audio::{Track, peak_stride, processed},
@@ -177,6 +178,8 @@ enum Action {
 }
 
 pub struct Studio {
+    script: script::Script,
+    show_script: bool,
     doc: Option<Document>,
     worker: Option<mpsc::Receiver<Result<Finished>>>,
     player: Option<Playback>,
@@ -189,6 +192,8 @@ impl Studio {
     pub fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>) -> Self {
         theme(&cc.egui_ctx);
         let mut app = Self {
+            script: script::Script::default(),
+            show_script: false,
             doc: None,
             worker: None,
             player: None,
@@ -197,7 +202,12 @@ impl Studio {
             close_after_work: false,
         };
         if let Some(path) = path {
-            app.import(&cc.egui_ctx, path);
+            if script::is_script(&path) {
+                app.show_script = true;
+                app.script.open(&cc.egui_ctx, path);
+            } else {
+                app.import(&cc.egui_ctx, path);
+            }
         }
         app
     }
@@ -396,25 +406,82 @@ impl Studio {
     }
 }
 
-fn theme(ctx: &Context) {
-    let mut fonts = egui::FontDefinitions::default();
+#[cfg(not(target_os = "macos"))]
+fn cjk_font(bold: bool) -> Option<egui::FontData> {
     let win = std::env::var_os("WINDIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("C:/Windows"));
-    let paths = [
-        win.join("Fonts/msyh.ttc"),
-        win.join("Fonts/simhei.ttf"),
-        PathBuf::from("/System/Library/Fonts/PingFang.ttc"),
-        PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
-    ];
-    if let Some(data) = paths.iter().find_map(|p| std::fs::read(p).ok()) {
-        fonts
-            .font_data
-            .insert("cjk".into(), egui::FontData::from_owned(data).into());
+    let paths = if bold {
+        vec![
+            win.join("Fonts/msyhbd.ttc"),
+            PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"),
+        ]
+    } else {
+        vec![
+            win.join("Fonts/msyh.ttc"),
+            win.join("Fonts/simhei.ttf"),
+            PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+        ]
+    };
+    paths
+        .iter()
+        .find_map(|p| std::fs::read(p).ok())
+        .map(egui::FontData::from_owned)
+}
+
+#[cfg(target_os = "macos")]
+fn cjk_font(bold: bool) -> Option<egui::FontData> {
+    // Core Text resolves system font assets even when their filesystem location changes.
+    let names = if bold {
+        [
+            "PingFangSC-Semibold",
+            "STHeitiSC-Medium",
+            "STSongti-SC-Bold",
+        ]
+    } else {
+        [
+            "PingFangSC-Regular",
+            "STHeitiSC-Light",
+            "STSongti-SC-Regular",
+        ]
+    };
+    names.iter().find_map(|name| {
+        let font = core_text::font::new_from_name(name, 17.).ok()?;
+        let path = font.url()?.to_path()?;
+        let bytes = std::fs::read(path).ok()?;
+        let count = ttf_parser::fonts_in_collection(&bytes).unwrap_or(1);
+        let index = (0..count).find(|&i| {
+            ttf_parser::Face::parse(&bytes, i).is_ok_and(|face| {
+                face.glyph_index('稿').is_some()
+                    && face.names().into_iter().any(|n| {
+                        n.name_id == ttf_parser::name_id::POST_SCRIPT_NAME
+                            && n.to_string().as_deref() == Some(*name)
+                    })
+            })
+        })?;
+        Some(egui::FontData {
+            index,
+            ..egui::FontData::from_owned(bytes)
+        })
+    })
+}
+
+fn theme(ctx: &Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    if let Some(data) = cjk_font(false) {
+        fonts.font_data.insert("cjk".into(), data.into());
         for family in [FontFamily::Proportional, FontFamily::Monospace] {
             fonts.families.entry(family).or_default().push("cjk".into());
         }
     }
+    let mut bold_family = fonts.families[&FontFamily::Proportional].clone();
+    if let Some(data) = cjk_font(true) {
+        fonts.font_data.insert("cjk-bold".into(), data.into());
+        bold_family.insert(0, "cjk-bold".into());
+    }
+    fonts
+        .families
+        .insert(FontFamily::Name("script-bold".into()), bold_family);
     ctx.set_fonts(fonts);
     let mut style = (*ctx.style()).clone();
     let mut v = egui::Visuals::dark();
@@ -697,12 +764,24 @@ impl eframe::App for Studio {
             self.status = "当前任务完成后将关闭窗口…".into();
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         } else if !busy && self.close_after_work {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            self.close_after_work = false;
+            if self.script.confirm_leave() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
             return;
+        } else if ctx.input(|i| i.viewport().close_requested()) && !self.script.confirm_leave() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
-        let mut action = ctx
-            .input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()))
-            .map(Action::Import);
+        let mut action = None;
+        if let Some(path) = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone())) {
+            if script::is_script(&path) {
+                self.show_script = true;
+                self.script.open(ctx, path);
+            } else if !busy {
+                self.show_script = false;
+                action = Some(Action::Import(path));
+            }
+        }
         egui::TopBottomPanel::top("header")
             .frame(panel(PANEL, 14))
             .show(ctx, |ui| {
@@ -710,8 +789,13 @@ impl eframe::App for Studio {
                     logo(ui);
                     ui.label(RichText::new("声剪").size(23.0).strong());
                     ui.separator();
-                    hint(ui, "播客编辑器");
+                    ui.selectable_value(&mut self.show_script, false, "音频剪辑");
+                    ui.selectable_value(&mut self.show_script, true, "讲稿编辑");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if self.show_script {
+                            self.script.header(ui);
+                            return;
+                        }
                         if ui
                             .add_enabled(
                                 !busy && self.doc.as_ref().is_some_and(|d| d.result.is_some()),
@@ -730,6 +814,10 @@ impl eframe::App for Studio {
                     });
                 });
             });
+        if self.show_script {
+            self.script.show(ctx);
+            return;
+        }
         egui::TopBottomPanel::bottom("status")
             .frame(panel(PLOT, 8))
             .show(ctx, |ui| {

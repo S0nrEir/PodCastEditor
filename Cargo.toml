@@ -16,9 +16,14 @@ rodio = { version = "0.20", default-features = false }
 symphonia = { version = "0.5.5", features = ["mp3", "aac", "alac", "isomp4", "flac", "vorbis", "wav", "pcm", "aiff"] }
 tempfile = "3"
 same-file = "1"
+pulldown-cmark = { version = "0.13", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-text = "20"
+ttf-parser = "0.25"
 
 [profile.dev]
 debug = 0
