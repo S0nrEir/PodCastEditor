@@ -1,0 +1,130 @@
+name: Publish 声剪 v0.1.0
+on:
+  push:
+    branches: [release/v0.1.0]
+permissions:
+  contents: read
+env:
+  RELEASE_COMMIT: 992a14f6bad4830a8639db3a8d5f537d136a1916
+  TAG: v0.1.0
+  CARGO_TERM_COLOR: never
+jobs:
+  retire-superseded-run:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Cancel the superseded packaging run if it is still active
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          run=45043665622
+          state=$(gh api "repos/$GH_REPO/actions/runs/$run" --jq .status)
+          if [[ "$state" != completed ]]; then
+            gh run cancel "$run" || test "$(gh api "repos/$GH_REPO/actions/runs/$run" --jq .status)" = completed
+          fi
+
+  windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Build and test Windows
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code "$RELEASE_COMMIT" HEAD -- Cargo.toml Cargo.lock src packaging
+          cargo build --locked --release --bins
+          cargo test --locked --release --lib studio::script
+      - name: Package and test installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $compiler = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          & $compiler /Qp '.github/release/windows.iss'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $setup = Get-Item 'dist/PodCastEditor-0.1.0-Windows-x64-Setup.exe'
+          $destination = Join-Path $env:RUNNER_TEMP 'installed-podcast-test'
+          $p = Start-Process $setup.FullName -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/DIR=`"$destination`"") -PassThru -Wait
+          if ($p.ExitCode -ne 0) { exit $p.ExitCode }
+          $version = & "$destination/podcast-editor.exe" --version
+          if ($version -ne 'podcast-editor 0.1.0') { throw "Unexpected version: $version" }
+          if (!(Test-Path "$destination/podcast-studio.exe")) { throw 'Desktop executable missing' }
+          $p = Start-Process "$destination/unins000.exe" -ArgumentList @('/VERYSILENT','/NORESTART') -PassThru -Wait
+          if ($p.ExitCode -ne 0 -or (Test-Path "$destination/podcast-studio.exe")) { throw 'Uninstall failed' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: dist/*-Windows-x64-Setup.exe
+          if-no-files-found: error
+  macos:
+    runs-on: macos-15
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Build, test and create universal app
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code "$RELEASE_COMMIT" HEAD -- Cargo.toml Cargo.lock src packaging
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo test --locked --release --lib studio::script
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --locked --release --target "$target" --bin podcast-studio
+          done
+          folder="$RUNNER_TEMP/image"
+          app="$folder/声剪.app"
+          mkdir -p "$app/Contents/MacOS" dist
+          cp packaging/macos/Info.plist "$app/Contents/Info.plist"
+          plutil -lint "$app/Contents/Info.plist"
+          lipo -create target/{aarch64,x86_64}-apple-darwin/release/podcast-studio -output "$app/Contents/MacOS/podcast-studio"
+          chmod 755 "$app/Contents/MacOS/podcast-studio"
+          codesign --force --sign - "$app"
+          ln -s /Applications "$folder/Applications"
+          dmg=dist/PodCastEditor-0.1.0-macOS-Universal.dmg
+          hdiutil create -volname "声剪" -srcfolder "$folder" -fs HFS+ -format UDZO "$dmg"
+          hdiutil verify "$dmg"
+          mount="$RUNNER_TEMP/mounted-release"
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount" "$dmg"
+          trap 'hdiutil detach "$mount"' EXIT
+          codesign --verify --strict "$mount/声剪.app"
+          lipo "$mount/声剪.app/Contents/MacOS/podcast-studio" -verify_arch arm64 x86_64
+          test "$(readlink "$mount/Applications")" = /Applications
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-installer
+          path: dist/*-macOS-Universal.dmg
+          if-no-files-found: error
+  release:
+    needs: [windows, macos, retire-superseded-run]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          path: installers
+          merge-multiple: true
+      - name: Publish both downloads
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          exe=installers/PodCastEditor-0.1.0-Windows-x64-Setup.exe
+          dmg=installers/PodCastEditor-0.1.0-macOS-Universal.dmg
+          test -s "$exe" && test -s "$dmg"
+          gh release create "$TAG" --verify-tag --draft --title "声剪 v0.1.0 · 播客讲稿、录音与剪辑" --notes-file .github/release/notes.md "$exe" "$dmg"
+          test "$(gh release view "$TAG" --json assets --jq '.assets | length')" = 2
+          gh release edit "$TAG" --draft=false --latest
