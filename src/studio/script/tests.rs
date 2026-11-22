@@ -140,6 +140,148 @@ fn select(doc: &mut Document, needle: &str) {
 }
 
 #[test]
+fn page_undo_follows_text_and_sidebar_edits_on_windows_and_mac() {
+    use egui::{Event, PointerButton, os::OperatingSystem};
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("撤销.md");
+    let original = "开场。";
+    fs::write(&path, original).unwrap();
+    for os in [OperatingSystem::Windows, OperatingSystem::Mac] {
+        let ctx = Context::default();
+        ctx.set_os(os);
+        super::super::theme(&ctx);
+        let command = Modifiers {
+            command: true,
+            ctrl: os == OperatingSystem::Windows,
+            mac_cmd: os == OperatingSystem::Mac,
+            ..Default::default()
+        };
+        let key = |key, modifiers| Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        let frame = |s: &mut Script, events| {
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1100., 720.),
+                )),
+                events,
+                ..Default::default()
+            };
+            let mut queued = Vec::new();
+            loop {
+                order_history_input(&mut input, &mut queued);
+                let output = ctx.run(input.take(), |ctx| s.show(ctx));
+                if queued.is_empty() {
+                    break output;
+                }
+            }
+        };
+        let mut script = Script {
+            names: names(),
+            ..Default::default()
+        };
+        script.open(&ctx, path.clone());
+        frame(&mut script, vec![]);
+        frame(&mut script, vec![key(Key::A, command)]);
+        let edited = "改过的正文🎧";
+        frame(
+            &mut script,
+            vec![
+                Event::Ime(egui::ImeEvent::Enabled),
+                Event::Ime(egui::ImeEvent::Preedit("g".into())),
+            ],
+        );
+        frame(
+            &mut script,
+            vec![Event::Ime(egui::ImeEvent::Preedit("gai".into()))],
+        );
+        frame(
+            &mut script,
+            vec![Event::Ime(egui::ImeEvent::Commit(edited.into()))],
+        );
+        frame(&mut script, vec![key(Key::A, command)]);
+        assert_eq!(script.doc.as_ref().unwrap().selected, 0..edited.len());
+        let out = frame(&mut script, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "验证" => {
+                    Some(text.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        for pressed in [true, false] {
+            frame(
+                &mut script,
+                vec![
+                    Event::PointerMoved(pos),
+                    Event::PointerButton {
+                        pos,
+                        button: PointerButton::Primary,
+                        pressed,
+                        modifiers: Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        let tagged = format!("<验证>{edited}</验证>");
+        assert_eq!(
+            script.doc.as_ref().unwrap().source,
+            tagged,
+            "{os:?} click {pos:?}: {}",
+            script.message
+        );
+
+        // A click elsewhere on the page can leave the manuscript without focus.
+        ctx.memory_mut(|m| m.surrender_focus(editor_id()));
+        frame(&mut script, vec![key(Key::Z, command)]);
+        let doc = script.doc.as_ref().unwrap();
+        assert_eq!(doc.source, edited);
+        assert_eq!(doc.selected, 0..edited.len());
+        assert!(doc.view.marks.is_empty());
+        frame(&mut script, vec![key(Key::Z, command)]);
+        assert_eq!(script.doc.as_ref().unwrap().source, original);
+        assert!(!script.doc.as_ref().unwrap().dirty());
+
+        let redo = if os == OperatingSystem::Mac {
+            key(Key::Z, command | Modifiers::SHIFT)
+        } else {
+            key(Key::Y, command)
+        };
+        frame(&mut script, vec![redo.clone(), redo.clone()]);
+        assert_eq!(script.doc.as_ref().unwrap().source, tagged);
+        frame(
+            &mut script,
+            vec![Event::Paste("另一个版本".into()), key(Key::Z, command)],
+        );
+        assert_eq!(script.doc.as_ref().unwrap().source, tagged);
+        frame(
+            &mut script,
+            vec![key(Key::Z, command), key(Key::Z, command)],
+        );
+        assert_eq!(script.doc.as_ref().unwrap().source, original);
+        frame(&mut script, vec![Event::Text("新版本".into()), redo]);
+        assert_eq!(script.doc.as_ref().unwrap().source, "新版本");
+
+        script.manage = true;
+        ctx.memory_mut(|m| m.request_focus(tag_name_id()));
+        frame(&mut script, vec![Event::Text("临时名称".into())]);
+        assert_eq!(script.new_name, "临时名称");
+        frame(&mut script, vec![key(Key::Z, command)]);
+        assert!(script.new_name.is_empty());
+        assert_eq!(script.doc.as_ref().unwrap().source, "新版本");
+    }
+}
+
+#[test]
 fn outline_shows_rendered_nested_and_attribute_text_in_both_modes() {
     let source = "<自定义>**甲**\r\n<补充=\"乙&amp;丙\"></自定义> <验证></验证>";
     for raw in [false, true] {

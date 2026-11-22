@@ -59,6 +59,27 @@ fn editor_id() -> Id {
     Id::new("script-content")
 }
 
+fn tag_name_id() -> Id {
+    Id::new("script-tag-name")
+}
+
+// A history shortcut runs before the text widget. If it arrives after typing,
+// a click, or another shortcut in one native input batch, finish those events first.
+pub(super) fn order_history_input(input: &mut egui::RawInput, queued: &mut Vec<egui::Event>) {
+    if !queued.is_empty() {
+        queued.append(&mut input.events);
+        std::mem::swap(queued, &mut input.events);
+    }
+    if let Some(index) = input.events.iter().enumerate().skip(1).find_map(|(i, e)| {
+        matches!(e, egui::Event::Key {
+            key: Key::Z | Key::Y, pressed: true, modifiers, ..
+        } if modifiers.command)
+        .then_some(i)
+    }) {
+        *queued = input.events.split_off(index);
+    }
+}
+
 fn outline_text(
     ui: &Ui,
     text: &str,
@@ -228,6 +249,16 @@ impl Script {
         {
             self.save();
         }
+        if ui
+            .add_enabled(
+                self.doc.as_ref().is_some_and(Document::can_undo),
+                egui::Button::new("撤销"),
+            )
+            .on_hover_text(shortcut_name(ui.ctx(), Key::Z))
+            .clicked()
+        {
+            self.undo(ui.ctx(), false);
+        }
         if ui.button("导入讲稿…").clicked() {
             self.pick(ui.ctx());
         }
@@ -254,6 +285,13 @@ impl Script {
         if let Some(doc) = &mut self.doc {
             doc.view = View::new(&doc.source, &self.names, self.raw);
             self.restore_selection(ctx, focus);
+        }
+    }
+
+    fn undo(&mut self, ctx: &Context, redo: bool) {
+        if self.doc.as_mut().is_some_and(|doc| doc.undo(redo)) {
+            self.rebuild(ctx, true);
+            self.result(Ok(()), if redo { "已重做" } else { "已撤销" });
         }
     }
 
@@ -318,6 +356,7 @@ impl Script {
             ui.horizontal(|ui| {
                 let input = ui.add(
                     TextEdit::singleline(&mut self.new_name)
+                        .id(tag_name_id())
                         .desired_width(128.)
                         .hint_text("新标签名称"),
                 );
@@ -395,7 +434,17 @@ impl Script {
     }
 
     fn shortcuts(&mut self, ctx: &Context) {
-        if self.picker || !ctx.memory(|m| m.has_focus(editor_id())) {
+        if self.doc.is_none() || self.picker || ctx.memory(|m| m.has_focus(tag_name_id())) {
+            return;
+        }
+        let redo = ctx.input_mut(|i| {
+            i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z)
+                || i.consume_key(Modifiers::COMMAND, Key::Y)
+        });
+        if redo || ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Z)) {
+            self.undo(ctx, redo);
+        }
+        if !ctx.memory(|m| m.has_focus(editor_id())) {
             return;
         }
         for (n, &key) in DIGITS.iter().take(self.names.len()).enumerate() {
@@ -407,16 +456,6 @@ impl Script {
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::T)) {
             self.picker = self.doc.as_ref().is_some_and(|d| !d.selected.is_empty());
             self.picker_index = 0;
-        }
-        let redo = ctx.input_mut(|i| {
-            i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z)
-                || i.consume_key(Modifiers::COMMAND, Key::Y)
-        });
-        if (redo || ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Z)))
-            && let Some(doc) = &mut self.doc
-        {
-            doc.undo(redo);
-            self.rebuild(ctx, true);
         }
     }
 
@@ -655,16 +694,34 @@ impl Script {
             state.store(ui.ctx(), scroll.id);
             ui.ctx().request_repaint();
         }
+        // Candidate updates replace each other. A committed IME phrase is one edit.
+        let preediting = ui.input(|i| {
+            i.events.iter().rev().find_map(|event| match event {
+                egui::Event::Ime(egui::ImeEvent::Preedit(_)) => Some(true),
+                egui::Event::Ime(egui::ImeEvent::Commit(_) | egui::ImeEvent::Disabled) => {
+                    Some(false)
+                }
+                _ => None,
+            })
+        });
         if let Some(source) = buffer.before {
-            doc.record(Snapshot {
-                source,
-                selection: old_selection,
-            });
+            doc.record_text(
+                Snapshot {
+                    source,
+                    selection: old_selection,
+                },
+                preediting == Some(true),
+            );
             self.message.clear();
             self.error = false;
             self.rebuild(ui.ctx(), false);
-        } else if updated {
-            ui.ctx().request_repaint();
+        } else {
+            if preediting == Some(false) || !ui.memory(|m| m.has_focus(editor_id())) {
+                doc.finish_preedit();
+            }
+            if updated {
+                ui.ctx().request_repaint();
+            }
         }
         if let Some(i) = apply {
             self.apply(ui.ctx(), i);

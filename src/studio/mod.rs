@@ -187,6 +187,7 @@ enum Mode {
 
 pub struct Studio {
     script: script::Script,
+    queued_script_events: Vec<egui::Event>,
     mode: Mode,
     recording: recording::Recording,
     doc: Option<Document>,
@@ -202,6 +203,7 @@ impl Studio {
         theme(&cc.egui_ctx);
         let mut app = Self {
             script: script::Script::default(),
+            queued_script_events: Vec::new(),
             mode: Mode::Audio,
             recording: Default::default(),
             doc: None,
@@ -777,6 +779,15 @@ fn editor(ui: &mut Ui, doc: &Document, playing: bool, action: &mut Option<Action
 }
 
 impl eframe::App for Studio {
+    fn raw_input_hook(&mut self, ctx: &Context, input: &mut egui::RawInput) {
+        if self.mode == Mode::Script || !self.queued_script_events.is_empty() {
+            script::order_history_input(input, &mut self.queued_script_events);
+            if !self.queued_script_events.is_empty() {
+                ctx.request_repaint();
+            }
+        }
+    }
+
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.poll();
         self.recording.poll();

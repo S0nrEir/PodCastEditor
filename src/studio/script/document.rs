@@ -42,6 +42,7 @@ pub struct Document {
     pub selected: Range<usize>, // byte offsets into the Markdown source
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
+    preedit: Option<Snapshot>,
 }
 
 impl Document {
@@ -66,6 +67,7 @@ impl Document {
             selected: 0..0,
             undo: vec![],
             redo: vec![],
+            preedit: None,
         })
     }
 
@@ -79,13 +81,13 @@ impl Document {
         Ok(())
     }
 
-    pub fn snapshot(&self) -> Snapshot {
+    fn snapshot(&self) -> Snapshot {
         Snapshot {
             source: self.source.clone(),
             selection: self.selected.clone(),
         }
     }
-    pub fn record(&mut self, old: Snapshot) {
+    fn record(&mut self, old: Snapshot) {
         if self.source == old.source {
             return;
         }
@@ -95,18 +97,41 @@ impl Document {
         }
         self.undo.push(old);
     }
-    pub fn undo(&mut self, redo: bool) {
-        let old = self.snapshot();
+    pub fn record_text(&mut self, old: Snapshot, preediting: bool) {
+        let start = self.preedit.take().unwrap_or(old);
+        if preediting {
+            self.preedit = Some(start);
+        } else {
+            self.record(start);
+        }
+    }
+    pub fn finish_preedit(&mut self) {
+        if let Some(start) = self.preedit.take() {
+            self.record(start);
+        }
+    }
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+            || self
+                .preedit
+                .as_ref()
+                .is_some_and(|s| s.source != self.source)
+    }
+    pub fn undo(&mut self, redo: bool) -> bool {
+        self.finish_preedit();
         let (from, to) = if redo {
             (&mut self.redo, &mut self.undo)
         } else {
             (&mut self.undo, &mut self.redo)
         };
-        if let Some(state) = from.pop() {
-            to.push(old);
-            self.source = state.source;
-            self.selected = state.selection;
-        }
+        let Some(state) = from.pop() else {
+            return false;
+        };
+        to.push(Snapshot {
+            source: std::mem::replace(&mut self.source, state.source),
+            selection: std::mem::replace(&mut self.selected, state.selection),
+        });
+        true
     }
 
     pub fn current_mark(&self) -> Option<&Mark> {
@@ -121,6 +146,7 @@ impl Document {
         let Some(mark) = self.current_mark().cloned() else {
             return;
         };
+        self.finish_preedit();
         let old = self.snapshot();
         let body = &self.source[mark.body];
         let text = if mark.attribute {
@@ -138,6 +164,7 @@ impl Document {
         if range.is_empty() {
             bail!("请先选中要标记的文字");
         }
+        self.finish_preedit();
         let old = self.snapshot();
         // Split at existing delimiters. Even a selection crossing one side of an annotation
         // remains well nested, and attribute values are never written as markup.
